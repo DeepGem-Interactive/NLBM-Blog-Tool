@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, jsonify, g, send_file
+from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, jsonify, g, send_file, flash
 from docx import Document
 from openai import AzureOpenAI
 from dotenv import load_dotenv
@@ -190,6 +190,14 @@ def init_db():
             ''')
         except pyodbc.Error:
             pass
+            
+        try:
+            cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('users') AND name = 'is_admin')
+            ALTER TABLE users ADD is_admin BIT DEFAULT 0
+            ''')
+        except pyodbc.Error:
+            pass
         
         # Update password column size to accommodate hashed passwords
         try:
@@ -322,6 +330,32 @@ def init_db():
             cursor.execute('''
             IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_user_activity_type_date')
             CREATE INDEX IX_user_activity_type_date ON user_activity(activity_type, created_at)
+            ''')
+        except pyodbc.Error:
+            pass
+        
+        # Create articles table if it doesn't exist
+        cursor.execute('''
+        IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'articles')
+        CREATE TABLE articles (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            title NVARCHAR(255) NOT NULL,
+            description NVARCHAR(MAX),
+            filename NVARCHAR(255) NOT NULL,
+            markdown_content NVARCHAR(MAX),
+            docx_content VARBINARY(MAX),
+            created_at DATETIME2 DEFAULT GETDATE(),
+            created_by INT REFERENCES users(id),
+            is_active BIT DEFAULT 1,
+            status NVARCHAR(50) DEFAULT 'active'
+        )
+        ''')
+        
+        # Create index for better query performance
+        try:
+            cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_articles_active_status')
+            CREATE INDEX IX_articles_active_status ON articles(is_active, status)
             ''')
         except pyodbc.Error:
             pass
@@ -492,6 +526,7 @@ class UserSession:
                 'planning_session': user.planning_session,
                 'other_planning_session': user.other_planning_session,
                 'discovery_call_link': user.discovery_call_link,
+                'is_admin': getattr(user, 'is_admin', False),
                 'custom_tones': [{'name': tone.name, 'description': tone.description} for tone in tones]
             }
             
@@ -1532,36 +1567,137 @@ class FileManager:
     @staticmethod
     def list_articles():
         """
-        List all DOCX files in the articles directory
+        List all articles (from database and file system)
         Returns:
             List of article filenames
         """
-        articles = [f for f in os.listdir(Config.ARTICLES_DIR) if f.endswith('.docx')]
-        return articles
+        # Get articles from database
+        db_articles = set()
+        try:
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("""
+                SELECT filename
+                FROM articles 
+                WHERE is_active = 1 AND status = 'active'
+            """)
+            for row in cursor.fetchall():
+                filename = row[0] if not hasattr(row, 'keys') else row['filename']
+                db_articles.add(filename)
+        except Exception as e:
+            print(f"Error getting articles from database: {str(e)}")
+        
+        # Get articles from file system
+        fs_articles = set()
+        try:
+            fs_articles = set([f for f in os.listdir(Config.ARTICLES_DIR) if f.endswith('.docx')])
+        except Exception as e:
+            print(f"Error getting articles from file system: {str(e)}")
+        
+        # Combine both sources
+        all_articles = list(db_articles.union(fs_articles))
+        print(f"DEBUG: list_articles() found {len(all_articles)} total articles")
+        print(f"DEBUG: Database articles: {list(db_articles)}")
+        print(f"DEBUG: File system articles: {list(fs_articles)}")
+        
+        return all_articles
     
     @staticmethod
     def get_article_metadata():
         """
-        Read and parse the metadata.json file
+        Read article metadata from database
         Returns:
             Dictionary of article metadata
         """
-        metadata_path = os.path.join(Config.ARTICLES_DIR, 'metadata.json')
         try:
-            with open(metadata_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                metadata = json.loads(content)
-                # Convert list to dictionary for easier lookup
-                result = {article['filename']: article for article in metadata['articles']}
-                return result
-        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-            print(f"Error reading metadata: {str(e)}")
-            return {}
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("""
+                SELECT id, title, description, filename, status
+                FROM articles 
+                WHERE is_active = 1 AND status = 'active'
+                ORDER BY created_at DESC
+            """)
+            articles = cursor.fetchall()
+            
+            print(f"DEBUG: Found {len(articles)} articles in database")
+            print(f"DEBUG: First article type: {type(articles[0]) if articles else 'No articles'}")
+            if articles:
+                print(f"DEBUG: First article content: {articles[0]}")
+            
+            result = {}
+            for i, article in enumerate(articles):
+                try:
+                    # Handle pyodbc.Row, dict, and tuple formats
+                    if hasattr(article, 'keys'):  # dict-like (pyodbc.Row or dict)
+                        filename = article['filename']
+                        result[filename] = {
+                            'id': article['id'],
+                            'title': article['title'],
+                            'description': article['description'],
+                            'status': article['status']
+                        }
+                    else:
+                        # Handle tuple format (id, title, description, filename, status)
+                        filename = article[3]  # filename is 4th column
+                        result[filename] = {
+                            'id': article[0],      # id
+                            'title': article[1],   # title
+                            'description': article[2],  # description
+                            'status': article[4]   # status
+                        }
+                    print(f"DEBUG: Successfully processed article {i}: {filename}")
+                except Exception as e:
+                    print(f"DEBUG: Error processing article {i}: {str(e)}")
+                    print(f"DEBUG: Article data: {article}")
+                    continue
+            
+            print(f"DEBUG: Final result has {len(result)} articles")
+            
+            # Also load existing articles from metadata.json to preserve descriptions
+            metadata_path = os.path.join(Config.ARTICLES_DIR, 'metadata.json')
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    metadata = json.loads(content)
+                    for article in metadata['articles']:
+                        filename = article['filename']
+                        if filename not in result:  # Only add if not already in database
+                            result[filename] = article
+                        else:
+                            # Merge descriptions from metadata.json if database description is empty
+                            if not result[filename].get('description') and article.get('description'):
+                                result[filename]['description'] = article['description']
+                print(f"DEBUG: After merging metadata.json, final result has {len(result)} articles")
+                print(f"DEBUG: Final article list: {list(result.keys())}")
+                # Debug specific article
+                target_article = "Don't Lose Your Family Stories_ How to Preserve Your Legacy Before It's Too Late.docx"
+                if target_article in result:
+                    print(f"DEBUG: Found target article metadata: {result[target_article]}")
+                else:
+                    print(f"DEBUG: Target article not found in result. Available keys: {list(result.keys())}")
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                print(f"DEBUG: Could not load metadata.json: {str(e)}")
+            
+            return result
+        except Exception as e:
+            print(f"Error reading article metadata from database: {str(e)}")
+            # Fallback to metadata.json for backward compatibility
+            metadata_path = os.path.join(Config.ARTICLES_DIR, 'metadata.json')
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    metadata = json.loads(content)
+                    result = {article['filename']: article for article in metadata['articles']}
+                    return result
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+                print(f"Error reading metadata.json fallback: {str(e)}")
+                return {}
     
     @staticmethod
     def read_docx(filename):
         """
-        Read content from a DOCX file
+        Read content from a DOCX file (database first, then file system fallback)
         Args:
             filename: Name of the DOCX file (may be URL-encoded)
         Returns:
@@ -1570,28 +1706,53 @@ class FileManager:
         # URL-decode the filename first
         decoded_filename = unquote(filename)
         
-        # For article filenames, we need to be more permissive
-        # Check if the file exists in the articles directory
-        filepath = os.path.join(Config.ARTICLES_DIR, decoded_filename)
+        try:
+            # Try to read from database first
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("""
+                SELECT markdown_content, docx_content
+                FROM articles 
+                WHERE filename = ? AND is_active = 1 AND status = 'active'
+            """, (decoded_filename,))
+            article = cursor.fetchone()
+            
+            if article and (article[0] if not hasattr(article, 'keys') else article['markdown_content']):
+                # Convert markdown to plain text for consistency
+                import re
+                # Get markdown content
+                markdown_content = article[0] if not hasattr(article, 'keys') else article['markdown_content']
+                # Remove markdown formatting
+                text = re.sub(r'#+\s*', '', markdown_content)  # Remove headers
+                text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Remove bold
+                text = re.sub(r'\*(.*?)\*', r'\1', text)  # Remove italic
+                return text.strip()
+            
+        except Exception as e:
+            print(f"Error reading from database: {str(e)}")
         
-        # Normalize the path to prevent path traversal
-        normalized_path = os.path.normpath(filepath)
-        
-        # Simple path traversal check - look for .. in the path
-        if '..' in normalized_path:
-            raise ValueError("Path traversal detected")
-        
-        # Check if file exists
-        if not os.path.exists(normalized_path):
+        # Fallback to file system
+        try:
+            filepath = os.path.join(Config.ARTICLES_DIR, decoded_filename)
+            normalized_path = os.path.normpath(filepath)
+            
+            if '..' in normalized_path:
+                raise ValueError("Path traversal detected")
+            
+            if not os.path.exists(normalized_path):
+                raise FileNotFoundError(f"Article file not found: {decoded_filename}")
+            
+            doc = Document(normalized_path)
+            return "\n".join([para.text for para in doc.paragraphs])
+            
+        except Exception as e:
+            print(f"Error reading from file system: {str(e)}")
             raise FileNotFoundError(f"Article file not found: {decoded_filename}")
-        
-        doc = Document(normalized_path)
-        return "\n".join([para.text for para in doc.paragraphs])
 
     @staticmethod
     def read_markdown(filename):
         """
-        Read content from a markdown file
+        Read content from a markdown file (database first, then file system fallback)
         Args:
             filename: Name of the markdown file (may be URL-encoded)
         Returns:
@@ -1600,28 +1761,46 @@ class FileManager:
         # URL-decode the filename first
         decoded_filename = unquote(filename)
         
-        # Convert .docx extension to .md extension
-        if decoded_filename.endswith('.docx'):
-            markdown_filename = decoded_filename.replace('.docx', '.md')
-        else:
-            markdown_filename = decoded_filename
+        try:
+            # Try to read from database first
+            db = get_db()
+            cursor = db.cursor()
+            cursor.execute("""
+                SELECT markdown_content
+                FROM articles 
+                WHERE filename = ? AND is_active = 1 AND status = 'active'
+            """, (decoded_filename,))
+            article = cursor.fetchone()
+            
+            if article and (article[0] if not hasattr(article, 'keys') else article['markdown_content']):
+                return article[0] if not hasattr(article, 'keys') else article['markdown_content']
+            
+        except Exception as e:
+            print(f"Error reading markdown from database: {str(e)}")
         
-        # Check if the file exists in the articles directory
-        filepath = os.path.join(Config.ARTICLES_DIR, markdown_filename)
-        
-        # Normalize the path to prevent path traversal
-        normalized_path = os.path.normpath(filepath)
-        
-        # Simple path traversal check - look for .. in the path
-        if '..' in normalized_path:
-            raise ValueError("Path traversal detected")
-        
-        # Check if file exists
-        if not os.path.exists(normalized_path):
-            raise FileNotFoundError(f"Markdown file not found: {markdown_filename}")
-        
-        with open(normalized_path, 'r', encoding='utf-8') as f:
-            return f.read()
+        # Fallback to file system
+        try:
+            # Convert .docx extension to .md extension
+            if decoded_filename.endswith('.docx'):
+                markdown_filename = decoded_filename.replace('.docx', '.md')
+            else:
+                markdown_filename = decoded_filename
+            
+            filepath = os.path.join(Config.ARTICLES_DIR, markdown_filename)
+            normalized_path = os.path.normpath(filepath)
+            
+            if '..' in normalized_path:
+                raise ValueError("Path traversal detected")
+            
+            if not os.path.exists(normalized_path):
+                raise FileNotFoundError(f"Markdown file not found: {markdown_filename}")
+            
+            with open(normalized_path, 'r', encoding='utf-8') as f:
+                return f.read()
+                
+        except Exception as e:
+            print(f"Error reading markdown from file system: {str(e)}")
+            raise FileNotFoundError(f"Markdown file not found: {decoded_filename}")
     
     @staticmethod
     def save_content(content):
@@ -1718,6 +1897,35 @@ def markdown_filter(text):
     html = markdown.markdown(text)
     soup = BeautifulSoup(html, 'html.parser')
     return str(soup)
+
+def require_admin(f):
+    """Decorator to require admin access"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Check if user is logged in
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        
+        user_data = session['user']
+        user_id = user_data.get('id')
+        
+        # Check admin status from session first
+        if user_data.get('is_admin'):
+            return f(*args, **kwargs)
+        
+        # Fallback: check database
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT is_admin FROM users WHERE id = ?", (user_id,))
+        user = cursor.fetchone()
+        
+        if not user or not user['is_admin']:
+            flash('Access denied. Admin privileges required.', 'error')
+            return redirect(url_for('dashboard'))
+        
+        return f(*args, **kwargs)
+    return decorated_function
 
 @app.route('/')
 def home():
@@ -2735,6 +2943,112 @@ def get_safe_file_path(base_dir, filename):
         raise ValueError("Path traversal detected")
     
     return full_path
+
+@app.route('/refresh-session')
+def refresh_session():
+    """Refresh user session with latest data from database"""
+    if 'user' not in session:
+        return redirect(url_for('login'))
+    
+    user_id = session['user']['id']
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    
+    if user:
+        # Get user's custom tones
+        cursor.execute('SELECT name, description FROM tones WHERE user_id = ?', (user.id,))
+        tones = cursor.fetchall()
+        
+        session['user'] = {
+            'id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'firm': user.firm,
+            'location': user.location,
+            'lawyer_name': user.lawyer_name,
+            'state': user.state,
+            'address': user.address,
+            'planning_session': user.planning_session,
+            'other_planning_session': user.other_planning_session,
+            'discovery_call_link': user.discovery_call_link,
+            'is_admin': getattr(user, 'is_admin', False),
+            'custom_tones': [{'name': tone.name, 'description': tone.description} for tone in tones]
+        }
+        session.modified = True
+        flash('Session refreshed successfully!', 'success')
+    
+    return redirect(url_for('dashboard'))
+
+@app.route('/admin/articles', methods=['GET', 'POST'])
+@require_admin
+def admin_articles():
+    """Admin interface for managing articles"""
+    db = get_db()
+    cursor = db.cursor()
+    
+    if request.method == 'POST':
+        # Handle file upload
+        if 'article_file' not in request.files:
+            flash('No file selected', 'error')
+            return redirect(url_for('admin_articles'))
+        
+        file = request.files['article_file']
+        title = request.form.get('title', '').strip()
+        description = request.form.get('description', '').strip()
+        
+        if file.filename == '':
+            flash('No file selected', 'error')
+            return redirect(url_for('admin_articles'))
+        
+        if not title:
+            flash('Title is required', 'error')
+            return redirect(url_for('admin_articles'))
+        
+        if not file.filename.lower().endswith('.docx'):
+            flash('Only DOCX files are allowed', 'error')
+            return redirect(url_for('admin_articles'))
+        
+        try:
+            # Read file content
+            file_content = file.read()
+            
+            # Convert DOCX to Markdown using existing function
+            from articles.docx_to_markdown import convert_docx_to_markdown
+            import io
+            
+            # Create a temporary file-like object
+            docx_io = io.BytesIO(file_content)
+            docx_io.name = file.filename
+            
+            # Convert to markdown
+            markdown_content = convert_docx_to_markdown(docx_io)
+            
+            # Store in database
+            cursor.execute("""
+                INSERT INTO articles (title, description, filename, markdown_content, docx_content, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (title, description, file.filename, markdown_content, file_content, session['user']['id']))
+            
+            db.commit()
+            flash(f'Article "{title}" uploaded successfully!', 'success')
+            
+        except Exception as e:
+            db.rollback()
+            flash(f'Error uploading article: {str(e)}', 'error')
+            print(f"Upload error: {e}")
+    
+    # Get all articles for display
+    cursor.execute("""
+        SELECT a.*, u.username as created_by_name
+        FROM articles a
+        LEFT JOIN users u ON a.created_by = u.id
+        ORDER BY a.created_at DESC
+    """)
+    articles = cursor.fetchall()
+    
+    return render_template('admin/articles.html', articles=articles)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)

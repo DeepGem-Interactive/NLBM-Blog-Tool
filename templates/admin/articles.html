@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block title %}Admin - Article Management{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h2><i class="fas fa-newspaper"></i> Article Management</h2>
+                <a href="{{ url_for('dashboard') }}" class="btn btn-outline-secondary">
+                    <i class="fas fa-arrow-left"></i> Back to Dashboard
+                </a>
+            </div>
+
+            <!-- Flash Messages -->
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} alert-dismissible fade show" role="alert">
+                            {{ message }}
+                            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                        </div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
+
+            <!-- Upload Form -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-upload"></i> Upload New Article</h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST" enctype="multipart/form-data">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="title" class="form-label">Article Title *</label>
+                                    <input type="text" class="form-control" id="title" name="title" required>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="article_file" class="form-label">DOCX File *</label>
+                                    <input type="file" class="form-control" id="article_file" name="article_file" accept=".docx" required>
+                                    <div class="form-text">Only DOCX files are allowed</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label for="description" class="form-label">Description</label>
+                            <textarea class="form-control" id="description" name="description" rows="3" placeholder="Brief description of the article..."></textarea>
+                        </div>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-upload"></i> Upload Article
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Articles List -->
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="fas fa-list"></i> Existing Articles ({{ articles|length }})</h5>
+                </div>
+                <div class="card-body">
+                    {% if articles %}
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Title</th>
+                                        <th>Description</th>
+                                        <th>Filename</th>
+                                        <th>Status</th>
+                                        <th>Created By</th>
+                                        <th>Created At</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for article in articles %}
+                                    <tr>
+                                        <td>
+                                            <strong>{{ article.title }}</strong>
+                                        </td>
+                                        <td>
+                                            {% if article.description %}
+                                                {{ article.description[:100] }}{% if article.description|length > 100 %}...{% endif %}
+                                            {% else %}
+                                                <em class="text-muted">No description</em>
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            <code>{{ article.filename }}</code>
+                                        </td>
+                                        <td>
+                                            <span class="badge bg-{{ 'success' if article.is_active else 'secondary' }}">
+                                                {{ 'Active' if article.is_active else 'Inactive' }}
+                                            </span>
+                                        </td>
+                                        <td>{{ article.created_by_name or 'Unknown' }}</td>
+                                        <td>{{ article.created_at.strftime('%Y-%m-%d %H:%M') if article.created_at else 'N/A' }}</td>
+                                        <td>
+                                            <div class="btn-group btn-group-sm" role="group">
+                                                <button type="button" class="btn btn-outline-info" onclick="previewArticle({{ article.id }})" title="Preview">
+                                                    <i class="fas fa-eye"></i>
+                                                </button>
+                                                <button type="button" class="btn btn-outline-{{ 'warning' if article.is_active else 'success' }}" 
+                                                        onclick="toggleArticleStatus({{ article.id }}, {{ 'false' if article.is_active else 'true' }})" 
+                                                        title="{{ 'Deactivate' if article.is_active else 'Activate' }}">
+                                                    <i class="fas fa-{{ 'pause' if article.is_active else 'play' }}"></i>
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    {% else %}
+                        <div class="text-center py-4">
+                            <i class="fas fa-newspaper fa-3x text-muted mb-3"></i>
+                            <h5 class="text-muted">No articles found</h5>
+                            <p class="text-muted">Upload your first article using the form above.</p>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Preview Modal -->
+<div class="modal fade" id="previewModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Article Preview</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="previewContent">
+                    <div class="text-center">
+                        <div class="spinner-border" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function previewArticle(articleId) {
+    const modal = new bootstrap.Modal(document.getElementById('previewModal'));
+    const content = document.getElementById('previewContent');
+    
+    content.innerHTML = '<div class="text-center"><div class="spinner-border" role="status"><span class="visually-hidden">Loading...</span></div></div>';
+    modal.show();
+    
+    // For now, just show a placeholder
+    setTimeout(() => {
+        content.innerHTML = '<div class="alert alert-info"><i class="fas fa-info-circle"></i> Article preview functionality will be implemented in the next phase.</div>';
+    }, 1000);
+}
+
+function toggleArticleStatus(articleId, newStatus) {
+    if (confirm(`Are you sure you want to ${newStatus ? 'activate' : 'deactivate'} this article?`)) {
+        // For now, just show a placeholder
+        alert('Article status toggle functionality will be implemented in the next phase.');
+    }
+}
+</script>
+{% endblock %}

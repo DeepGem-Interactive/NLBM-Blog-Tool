@@ -183,6 +183,14 @@
                                     <i data-feather="user" class="icon-sm me-2"></i>My Profile
                                 </a>
                             </li>
+                            
+                            {% if session.get('user') and session.get('user').is_admin %}
+                            <li>
+                                <a class="dropdown-item" href="{{ url_for('admin_articles') }}">
+                                    <i data-feather="settings" class="icon-sm me-2"></i>Admin Panel
+                                </a>
+                            </li>
+                            {% endif %}
 
                             <li><hr class="dropdown-divider"></li>
                             <li>

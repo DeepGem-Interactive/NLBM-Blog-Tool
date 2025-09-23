@@ -2,18 +2,43 @@
     "articles": [
         {
             "filename": "A Texas Mail Carrier's Act of Love Shows Why Your Pets Need a Plan Too.docx",
-            "title": "Texas Mail Carrier's Act of Love Shows Why Your Pets Need a Plan",
-            "description": "When Ian Burke, a Texas mail carrier, rushed to adopt Floyd—a 70-pound dog whose owner had died—he saved one pet from an uncertain fate. This heartwarming story highlights why proper pet planning is essential for every family."
+            "title": "Texas Mail Carrier's Act of Love Shows Why your Pets...",
+            "description": "When Ian Burke, a Texas mail carrier, rushed to adopt Floyd—a 70-pound dog whose owner had died—he saved one pet from an uncertain fate."
         },
         {
             "filename": "Bonus PFL Blog_ Heads Up! Major Tax Changes on the Horizon.docx",
             "title": "Bonus PFL Blog_ Heads Up! Major Tax Changes on the Horizon",
-            "description": "The House recently passed significant tax legislation that could reshape the tax landscape for individuals and businesses. Stay informed about these changes and how they might affect your financial planning strategies."
+            "description": "The House recently passed significant tax legislation that could reshape the tax landscape for individuals and businesses and these changes might affect your planning."
         },
         {
-            "filename": "Life, Liberty, and Legacy_ How Life & Legacy Planning Promotes Independence.docx", 
-            "title": " How Life & Legacy Planning Promotes Independence",
+            "filename": "Life, Liberty, and Legacy_ How Life & Legacy Planning Promotes Independence.docx",
+            "title": "How Life & Legacy Planning Promotes Independence",
             "description": "Independence Day reminds us that true freedom requires intentional planning and sacrifice. Just as the founders created a framework for lasting liberty, your Life & Legacy Plan creates lasting security for your loved ones."
+        },
+        {
+            "filename": "Don’t Lose Your Family Stories_ How to Preserve Your Legacy Before It’s Too Late.docx",
+            "title": "Don’t Lose Your Family Stories, Preserve Your Legacy Before It's Too Late",
+            "description": "Family stories are the threads that connect generations, but they're disappearing faster than ever. We're here to help you in how to preserve your legacy before it's too late."
+        },
+        {
+            "filename": "Living With Loss_ The Daily Impact of Grief and the Gift of Planning Ahead.docx",
+            "title": "Living With Loss - Daily Impact of Grief and the Gift of Planning Ahead",
+            "description": "Grief doesn't end with the funeral—it becomes a daily companion that affects every decision, every relationship, every moment. Here's how planning ahead can be one of the greatest gifts you give your loved ones."
+        },
+        {
+            "filename": "The $1.5 Million Estate Planning Mistake You Can't Afford to Make.docx",
+            "title": "$1.5 Million Estate Planning Mistake You Can't Afford to Make",
+            "description": "A simple oversight in estate planning could cost your family $1.5 million or more. Here's the mistake that's more common than you think—and how to avoid it."
+        },
+        {
+            "filename": "The Surprising Connection Between Meal Planning and Estate Planning Done the Right Way.docx",
+            "title": "Surprising Connection Between Meal Planning & Estate...",
+            "description": "At first glance, meal planning and estate planning seem worlds apart. But dig deeper, and you'll discover they share the same fundamental principle: intentional preparation for future needs."
+        },
+        {
+            "filename": "When Every Dollar Counts_ How Labor Day Reminds Us That Life & Legacy Planning Is More Essential Than Ever.docx",
+            "title": "How Labor Day Reminds Us That Life & Legacy Planning...",
+            "description": "Labor Day celebrates the dignity of work and the value of every dollar earned through honest effort. A perfect time to reflect on how your hard work can create lasting security."
         }
     ]
 }
