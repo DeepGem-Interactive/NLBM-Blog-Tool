@@ -677,7 +677,7 @@ class UserSession:
             return False
 
 class Config:
-    ARTICLES_DIR = "articles"
+    ARTICLES_DIR = "content/articles"
     GENERATED_DIR = "generated"
     os.makedirs(ARTICLES_DIR, exist_ok=True)
     os.makedirs(GENERATED_DIR, exist_ok=True)
@@ -1385,7 +1385,7 @@ class AzureServices:
             cleaned_content = self._clean_article_content(article_content)
             
             # Read the external template file
-            template_path = os.path.join(Config.ARTICLES_DIR, 'template.md')
+            template_path = os.path.join(Config.ARTICLES_DIR, 'markdown', 'template.md')
             try:
                 with open(template_path, 'r', encoding='utf-8') as f:
                     template_content = f.read()
@@ -1590,7 +1590,8 @@ class FileManager:
         # Get articles from file system
         fs_articles = set()
         try:
-            fs_articles = set([f for f in os.listdir(Config.ARTICLES_DIR) if f.endswith('.docx')])
+            docx_dir = os.path.join(Config.ARTICLES_DIR, 'docx')
+            fs_articles = set([f for f in os.listdir(docx_dir) if f.endswith('.docx')])
         except Exception as e:
             print(f"Error getting articles from file system: {str(e)}")
         
@@ -1733,7 +1734,7 @@ class FileManager:
         
         # Fallback to file system
         try:
-            filepath = os.path.join(Config.ARTICLES_DIR, decoded_filename)
+            filepath = os.path.join(Config.ARTICLES_DIR, 'docx', decoded_filename)
             normalized_path = os.path.normpath(filepath)
             
             if '..' in normalized_path:
@@ -1786,7 +1787,7 @@ class FileManager:
             else:
                 markdown_filename = decoded_filename
             
-            filepath = os.path.join(Config.ARTICLES_DIR, markdown_filename)
+            filepath = os.path.join(Config.ARTICLES_DIR, 'markdown', markdown_filename)
             normalized_path = os.path.normpath(filepath)
             
             if '..' in normalized_path:
@@ -2875,7 +2876,7 @@ def preview_article(article):
         
         # For article filenames, we need to be more permissive
         # Check if the file exists in the articles directory
-        article_path = os.path.join(Config.ARTICLES_DIR, decoded_article)
+        article_path = os.path.join(Config.ARTICLES_DIR, 'docx', decoded_article)
         normalized_article_path = os.path.normpath(article_path)
         
         # Simple path traversal check - look for .. in the path
@@ -2884,7 +2885,7 @@ def preview_article(article):
         
         # Try to read markdown file first
         markdown_filename = decoded_article.replace('.docx', '.md')
-        markdown_path = os.path.join(Config.ARTICLES_DIR, markdown_filename)
+        markdown_path = os.path.join(Config.ARTICLES_DIR, 'markdown', markdown_filename)
         normalized_markdown_path = os.path.normpath(markdown_path)
         
         # Ensure markdown path is also safe
@@ -3015,7 +3016,7 @@ def admin_articles():
             file_content = file.read()
             
             # Convert DOCX to Markdown using existing function
-            from articles.docx_to_markdown import convert_docx_to_markdown
+            from content.articles.docx_to_markdown import convert_docx_to_markdown
             import io
             
             # Create a temporary file-like object

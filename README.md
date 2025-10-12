@@ -12,7 +12,7 @@ pip install -r requirements.txt
 
 ### 2. Prepare the Documents
 
-Place the legal DOCX files in the `articles/` directory.
+Place the legal DOCX files in the `content/articles/docx/` directory.
 
 ## Running the Application
 
@@ -32,7 +32,7 @@ The application will be available at `http://localhost:5000`
   - Password: `password123`
 
 ### 2. Select an Article
-- Choose from available DOCX files in `articles/` folder
+- Choose from available DOCX files in `content/articles/docx/` folder
 
 ### 3. Customize the Post
 - Select a tone (or specify custom tone)

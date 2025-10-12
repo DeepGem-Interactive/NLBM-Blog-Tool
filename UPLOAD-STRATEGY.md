@@ -67,7 +67,7 @@ class AzureBlobStorage:
         self.blob_service = BlobServiceClient.from_connection_string(self.connection_string)
     
     def upload_docx(self, file_content, filename):
-        blob_name = f"articles/{filename}"
+        blob_name = f"content/articles/docx/{filename}"
         blob_client = self.blob_service.get_blob_client(
             container=self.container_name, 
             blob=blob_name

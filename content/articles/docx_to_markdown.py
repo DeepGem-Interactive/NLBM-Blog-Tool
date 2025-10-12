@@ -54,17 +54,19 @@ def convert_docx_to_markdown(docx_path):
     return '\n'.join(markdown_lines)
 
 def process_all_docx_files():
-    """Process all DOCX files in the current directory."""
+    """Process all DOCX files in the docx subdirectory."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Create a 'markdown' subdirectory if it doesn't exist
+    docx_dir = os.path.join(current_dir, 'docx')
     markdown_dir = os.path.join(current_dir, 'markdown')
+    
+    # Create directories if they don't exist
+    os.makedirs(docx_dir, exist_ok=True)
     os.makedirs(markdown_dir, exist_ok=True)
     
     # Process each DOCX file
-    for filename in os.listdir(current_dir):
+    for filename in os.listdir(docx_dir):
         if filename.endswith('.docx'):
-            docx_path = os.path.join(current_dir, filename)
+            docx_path = os.path.join(docx_dir, filename)
             markdown_content = convert_docx_to_markdown(docx_path)
             
             # Create markdown filename
