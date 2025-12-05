@@ -43,6 +43,7 @@
                     {% endif %}
                     
                     <form method="POST" id="profile-form">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                         <div class="row">
                             <div class="col-md-6">
                                 <div class="form-group">

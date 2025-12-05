@@ -1,0 +1,77 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ main, develop, master ]
+  pull_request:
+    branches: [ main, develop, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y unixodbc-dev
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run tests with coverage
+      env:
+        FLASK_SECRET_KEY: test-secret-key-for-ci
+        FLASK_DEBUG: false
+        AZURE_SQL_SERVER: test-server
+        AZURE_SQL_DATABASE: test-db
+        AZURE_SQL_USERNAME: test-user
+        AZURE_SQL_PASSWORD: test-password
+        AZURE_FUNCTION_APP_URL: https://test-function-app.azurewebsites.net
+        FUNCTION_KEY: test-function-key
+        AZURE_OPENAI_KEY: test-openai-key
+        AZURE_OPENAI_ENDPOINT: https://test-openai.openai.azure.com
+        AZURE_OPENAI_DEPLOYMENT: test-deployment
+        AZURE_DALLE_KEY: test-dalle-key
+        AZURE_DALLE_ENDPOINT: https://test-dalle.openai.azure.com
+        AZURE_DALLE_DEPLOYMENT: test-dalle-deployment
+        SIMULATE_OPENAI: true
+      run: |
+        pytest tests/ --cov=app --cov=function_app --cov-report=xml --cov-report=html --cov-report=term
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+    
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report-${{ matrix.python-version }}
+        path: htmlcov/
+
+

@@ -409,6 +409,7 @@
                         
                         <!-- Article selection form -->
                         <form method="POST" action="{{ url_for('select_article', article=article) }}" class="mb-3 article-form">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                             <button type="submit" class="btn btn-primary w-100">
                                 <i data-feather="edit-2" class="icon-sm me-1"></i>Generate Article
                             </button>

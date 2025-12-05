@@ -8,6 +8,7 @@
     <h1>Select Your Preferred Tone</h1>
     
     <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
         <div class="mb-4">
             <h3>Predefined Tones</h3>
             {% for tone in tone_options %}
