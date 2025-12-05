@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Error {{ error_code }} - NLBM Blog Tool{% endblock %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card">
+                <div class="card-header bg-danger text-white">
+                    <h3 class="h4 mb-0">Error {{ error_code }}</h3>
+                </div>
+                <div class="card-body text-center py-5">
+                    <div class="mb-4">
+                        {% if error_code == 404 %}
+                            <i data-feather="file-x" class="icon-lg text-muted"></i>
+                        {% elif error_code == 500 %}
+                            <i data-feather="alert-circle" class="icon-lg text-danger"></i>
+                        {% elif error_code == 403 %}
+                            <i data-feather="lock" class="icon-lg text-warning"></i>
+                        {% elif error_code == 400 %}
+                            <i data-feather="x-circle" class="icon-lg text-danger"></i>
+                        {% else %}
+                            <i data-feather="alert-triangle" class="icon-lg text-warning"></i>
+                        {% endif %}
+                    </div>
+                    
+                    <h4 class="mb-3">{{ error_message or "An error occurred" }}</h4>
+                    
+                    <p class="text-muted mb-4">
+                        {% if error_code == 404 %}
+                            The page you're looking for doesn't exist or has been moved.
+                        {% elif error_code == 500 %}
+                            We're sorry, but something went wrong on our end. Please try again later.
+                        {% elif error_code == 403 %}
+                            You don't have permission to access this resource.
+                        {% elif error_code == 400 %}
+                            Your request was invalid. Please check your input and try again.
+                        {% else %}
+                            An unexpected error occurred. Please try again.
+                        {% endif %}
+                    </p>
+                    
+                    <div class="mt-4">
+                        <a href="{{ url_for('dashboard') }}" class="btn btn-primary me-2">
+                            <i data-feather="home" class="icon-sm me-1"></i> Go to Dashboard
+                        </a>
+                        <a href="javascript:history.back()" class="btn btn-outline-secondary">
+                            <i data-feather="arrow-left" class="icon-sm me-1"></i> Go Back
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    feather.replace();
+</script>
+{% endblock %}
+

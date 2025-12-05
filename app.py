@@ -1,4 +1,7 @@
-from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, jsonify, g, send_file, flash
+from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory, jsonify, g, send_file, flash, abort
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from docx import Document
 from openai import AzureOpenAI
 from dotenv import load_dotenv
@@ -31,14 +34,73 @@ import asyncio
 import httpx
 import random
 import aiohttp
+import logging
+from logging.handlers import RotatingFileHandler
+from html import escape
+from typing import Optional, Tuple, Dict, Any, List
+from utils.validation import validate_email, validate_password, validate_text_input, sanitize_input
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler('app.log', maxBytes=10485760, backupCount=10),  # 10MB per file, 10 backups
+        logging.StreamHandler()  # Also log to console
+    ]
+)
+logger = logging.getLogger(__name__)
 
+# Set log level based on environment
+if os.getenv('FLASK_DEBUG', 'false').lower() == 'true':
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
 
 load_dotenv()
 
 app = Flask(__name__, static_folder='static')
 app.secret_key = os.getenv('FLASK_SECRET_KEY')
 app.config['UPLOAD_FOLDER'] = 'static/generated'
+
+# CSRF Protection
+csrf = CSRFProtect(app)
+app.config['WTF_CSRF_ENABLED'] = True
+app.config['WTF_CSRF_TIME_LIMIT'] = 3600  # 1 hour
+
+# Make csrf_token available in all templates
+@app.context_processor
+def inject_csrf_token():
+    """Make CSRF token function available in all templates"""
+    def get_csrf_token():
+        return generate_csrf()
+    return dict(csrf_token=get_csrf_token)
+
+# Rate Limiting
+def get_user_id_or_ip() -> str:
+    """
+    Get user ID from session if logged in, otherwise use IP address.
+    
+    Used as key function for rate limiting to track limits per user or IP.
+    
+    Returns:
+        User ID as string if logged in, otherwise IP address
+    """
+    try:
+        if 'user' in session and session.get('user', {}).get('id'):
+            return str(session['user']['id'])
+    except RuntimeError:
+        # Outside request context
+        pass
+    return get_remote_address()
+
+limiter = Limiter(
+    app=app,
+    key_func=get_user_id_or_ip,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",  # In-memory storage (use Redis in production)
+    strategy="fixed-window"
+)
 
 # Database configuration
 app.config['AZURE_SQL_SERVER'] = os.getenv('AZURE_SQL_SERVER')
@@ -77,14 +139,25 @@ async def make_async_request(url, payload):
             response.raise_for_status()
             return response.json()
         except httpx.RequestError as e:
-            print(f"Request error: {e}")
+            logger.error(f"Request error for {url}: {e}", exc_info=True)
             raise
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error: {e.response.status_code} - {e.response.text}")
+            logger.error(f"HTTP error {e.response.status_code} for {url}: {e.response.text}")
             raise
 
 
-def get_db():
+def get_db(max_retries=3, retry_delay=1):
+    """
+    Get database connection with retry logic and timeout configuration.
+    Uses Flask's g object to store connection per request.
+    
+    Args:
+        max_retries: Maximum number of connection retry attempts
+        retry_delay: Delay in seconds between retries
+    
+    Returns:
+        Database connection object
+    """
     if 'db' not in g:
         conn_str = (
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -93,14 +166,45 @@ def get_db():
             f"UID={app.config['AZURE_SQL_USERNAME']};"
             f"PWD={app.config['AZURE_SQL_PASSWORD']};"
             "Encrypt=yes;TrustServerCertificate=no;"
+            "Connection Timeout=30;"  # 30 second connection timeout
         )
-        g.db = pyodbc.connect(conn_str)
+        
+        # Retry logic for transient connection failures
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                g.db = pyodbc.connect(conn_str, timeout=30)
+                # Set connection timeout for queries
+                g.db.timeout = 30
+                logger.debug(f"Database connection established (attempt {attempt + 1})")
+                break
+            except (pyodbc.OperationalError, pyodbc.InterfaceError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"Database connection attempt {attempt + 1} failed: {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to connect to database after {max_retries} attempts: {e}", exc_info=True)
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected database connection error: {e}", exc_info=True)
+                raise
+    
     return g.db
 
-def close_db():
+# Database cleanup handler
+@app.teardown_appcontext
+def close_db(error=None):
+    """Close database connection at end of request"""
     db = g.pop('db', None)
     if db is not None:
-        db.close()
+        try:
+            db.close()
+            logger.debug("Database connection closed")
+        except Exception as e:
+            logger.warning(f"Error closing database connection: {e}", exc_info=True)
+
+# Database cleanup is now handled by teardown_appcontext in get_db()
 
 def init_db():
     with app.app_context():
@@ -220,48 +324,9 @@ def init_db():
         )
         ''')
         
-        # Check if default users exist
-        cursor.execute("SELECT * FROM users WHERE username IN ('admin', 'memberhub')")
-        existing_users = cursor.fetchall()
-        existing_usernames = [user.username for user in existing_users]
-        
-        if 'admin' not in existing_usernames:
-            cursor.execute('''
-            INSERT INTO users (username, email, password, firm, location, lawyer_name, state, address, 
-                             planning_session, other_planning_session, discovery_call_link)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                'admin', 
-                'admin@lawfirm.com', 
-                'password123', 
-                'Legal Partners', 
-                'New York', 
-                'John', 
-                'NY',
-                '',
-                '',
-                '',
-                ''
-            ))
-        
-        if 'memberhub' not in existing_usernames:
-            cursor.execute('''
-            INSERT INTO users (username, email, password, firm, location, lawyer_name, state, address, 
-                             planning_session, other_planning_session, discovery_call_link)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                'memberhub', 
-                'memberhub@newlawbusinessmodel.com', 
-                'memberhub123', 
-                'New Law Business Model', 
-                'Global', 
-                'Member Hub', 
-                'CA',
-                '',
-                '',
-                '',
-                ''
-            ))
+        # NOTE: Default users with hardcoded credentials have been removed for security.
+        # To create an admin user, use the registration endpoint or create a secure setup script.
+        # For production, create admin users through a secure first-run setup process.
         
         # Create password_resets table if it doesn't exist
         cursor.execute('''
@@ -395,7 +460,7 @@ class UserActivityTracker:
             db.commit()
             return True
         except Exception as e:
-            print(f"Error logging user activity: {str(e)}")
+            logger.error(f"Error logging user activity: {str(e)}", exc_info=True)
             return False
     
     @staticmethod
@@ -440,7 +505,7 @@ class UserActivityTracker:
             
             return cursor.fetchall()
         except Exception as e:
-            print(f"Error getting activity summary: {str(e)}")
+            logger.error(f"Error getting activity summary: {str(e)}", exc_info=True)
             return []
     
     @staticmethod
@@ -466,26 +531,100 @@ class UserActivityTracker:
             
             return cursor.fetchall()
         except Exception as e:
-            print(f"Error getting feature usage stats: {str(e)}")
+            logger.error(f"Error getting feature usage stats: {str(e)}", exc_info=True)
             return []
 
 class UserSession:
+    """
+    User session management class handling registration, login, and profile operations.
+    
+    Provides static methods for user authentication, profile management, and session handling.
+    All methods include input validation and proper error handling.
+    """
+    
     @staticmethod
-    def register(email, password, firm, location, lawyer_name, state, address="", planning_session="", other_planning_session="", discovery_call_link=""):
+    def register(email: str, password: str, firm: str, location: str, lawyer_name: str, 
+                 state: str, address: str = "", planning_session: str = "", 
+                 other_planning_session: str = "", discovery_call_link: str = "") -> Tuple[bool, Optional[str]]:
+        """
+        Register a new user with validation.
+        
+        Args:
+            email: User email address (validated)
+            password: User password (must meet strength requirements)
+            firm: Law firm name
+            location: Firm location
+            lawyer_name: Name of the lawyer
+            state: State abbreviation
+            address: Optional address
+            planning_session: Optional planning session name
+            other_planning_session: Optional other planning session
+            discovery_call_link: Optional discovery call link
+            
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+            - (True, None) on success
+            - (False, error_message) on failure
+        """
+        # Validate inputs
+        email_valid, email_error = validate_email(email)
+        if not email_valid:
+            logger.warning(f"Registration failed: {email_error}")
+            return False, email_error
+        
+        password_valid, password_error = validate_password(password)
+        if not password_valid:
+            logger.warning(f"Registration failed: {password_error}")
+            return False, password_error
+        
+        # Validate and sanitize text inputs
+        firm_valid, firm_error = validate_text_input(firm, "Firm name", min_length=1, max_length=200, required=True)
+        if not firm_valid:
+            logger.warning(f"Registration failed: {firm_error}")
+            return False, firm_error
+        
+        location_valid, location_error = validate_text_input(location, "Location", min_length=1, max_length=200, required=True)
+        if not location_valid:
+            logger.warning(f"Registration failed: {location_error}")
+            return False, location_error
+        
+        lawyer_name_valid, lawyer_name_error = validate_text_input(lawyer_name, "Lawyer name", min_length=1, max_length=200, required=True)
+        if not lawyer_name_valid:
+            logger.warning(f"Registration failed: {lawyer_name_error}")
+            return False, lawyer_name_error
+        
+        state_valid, state_error = validate_text_input(state, "State", min_length=2, max_length=50, required=True)
+        if not state_valid:
+            logger.warning(f"Registration failed: {state_error}")
+            return False, state_error
+        
+        # Sanitize optional fields
+        address = sanitize_input(address, max_length=500) if address else ""
+        planning_session = sanitize_input(planning_session, max_length=200) if planning_session else ""
+        other_planning_session = sanitize_input(other_planning_session, max_length=200) if other_planning_session else ""
+        discovery_call_link = sanitize_input(discovery_call_link, max_length=500) if discovery_call_link else ""
+        
         db = get_db()
         username = email.split('@')[0].lower()
         try:
+            # Hash password before storing
+            hashed_password = generate_password_hash(password)
             cursor = db.cursor()
             cursor.execute('''
             INSERT INTO users (username, email, password, firm, location, lawyer_name, state, address, 
                              planning_session, other_planning_session, discovery_call_link)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (username, email, password, firm, location, lawyer_name, state, address, 
+            ''', (username, email, hashed_password, firm, location, lawyer_name, state, address, 
                  planning_session, other_planning_session, discovery_call_link))
             db.commit()
-            return True
+            logger.info(f"User registered successfully: {email}")
+            return True, None
         except pyodbc.IntegrityError:
-            return False
+            logger.warning(f"Registration failed: Email already registered - {email}")
+            return False, "Email already registered"
+        except Exception as e:
+            logger.error(f"Registration error: {str(e)}", exc_info=True)
+            return False, "Registration failed. Please try again."
 
     @staticmethod
     def login(email, password):
@@ -495,7 +634,33 @@ class UserSession:
         cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
         user = cursor.fetchone()
         
-        if user and user.password == password:
+        if not user:
+            return False
+        
+        # Check password - support both hashed (new) and plain text (legacy) passwords
+        password_valid = False
+        stored_password = user.password
+        
+        # First, try checking against hashed password (for new passwords)
+        # Werkzeug can use pbkdf2:sha256: or scrypt: format
+        if stored_password and (stored_password.startswith('pbkdf2:sha256:') or stored_password.startswith('scrypt:')):
+            # Password is hashed, use check_password_hash
+            password_valid = check_password_hash(stored_password, password)
+            # If valid and password was hashed, we're good
+        else:
+            # Password is stored in plain text (legacy), compare directly
+            if stored_password == password:
+                password_valid = True
+                # Migrate to hashed password for security
+                try:
+                    hashed_password = generate_password_hash(password)
+                    cursor.execute('UPDATE users SET password = ? WHERE id = ?', (hashed_password, user.id))
+                    db.commit()
+                except Exception as e:
+                    # Log error but don't fail login
+                    logger.warning(f"Failed to migrate password to hashed format for user {user.id}: {e}", exc_info=True)
+        
+        if password_valid:
             # Check if user is blocked
             if hasattr(user, 'is_blocked') and user.is_blocked:
                 # Log blocked user login attempt
@@ -543,16 +708,15 @@ class UserSession:
             return True
         else:
             # Log failed login attempt if user exists
-            if user:
-                UserActivityTracker.log_activity(
-                    user_id=user.id,
-                    activity_type="authentication",
-                    feature_name="User Login",
-                    api_endpoint="N/A",
-                    success=False,
-                    error_message="Invalid password",
-                    additional_data=f"Failed login attempt from email: {email}"
-                )
+            UserActivityTracker.log_activity(
+                user_id=user.id,
+                activity_type="authentication",
+                feature_name="User Login",
+                api_endpoint="N/A",
+                success=False,
+                error_message="Invalid password",
+                additional_data=f"Failed login attempt from email: {email}"
+            )
             return False
 
     @staticmethod
@@ -615,7 +779,7 @@ class UserSession:
             
             return True
         except Exception as e:
-            print(f"Error blocking/unblocking user: {str(e)}")
+            logger.error(f"Error blocking/unblocking user: {str(e)}", exc_info=True)
             return False
     
     @staticmethod
@@ -628,7 +792,7 @@ class UserSession:
             result = cursor.fetchone()
             return result and result.is_blocked
         except Exception as e:
-            print(f"Error checking user block status: {str(e)}")
+            logger.error(f"Error checking user block status: {str(e)}", exc_info=True)
             return False
 
     @staticmethod
@@ -673,7 +837,7 @@ class UserSession:
             db.commit()
             return True
         except Exception as e:
-            print(f"Error submitting feedback: {str(e)}")
+            logger.error(f"Error submitting feedback: {str(e)}", exc_info=True)
             return False
 
 class Config:
@@ -699,6 +863,12 @@ class Config:
     }
 
 class AzureServices:
+    """
+    Service class for interacting with Azure OpenAI and content generation services.
+    
+    Handles content rewriting, validation, and section preservation for blog articles.
+    """
+    
     def __init__(self):
         self.text_client = AzureOpenAI(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
@@ -714,17 +884,16 @@ class AzureServices:
             paragraphs = content.split('\n\n')
             preserved_sections = {}
             
-            print(f"\n=== EXTRACTING SECTIONS ===")
-            print(f"Total paragraphs found: {len(paragraphs)}")
+            logger.debug(f"Extracting sections - Total paragraphs found: {len(paragraphs)}")
             
             # Extract Hook (first paragraph)
             hook_start = Config.SECTION_MARKERS['hook']['start']
             hook_end = Config.SECTION_MARKERS['hook']['end']
             if hook_start < len(paragraphs):
                 preserved_sections['hook'] = paragraphs[hook_start:hook_end][0] if hook_end - hook_start == 1 else '\n\n'.join(paragraphs[hook_start:hook_end])
-                print(f"✓ Extracted Hook (paragraph 1): {preserved_sections['hook'][:100]}...")
+                logger.debug(f"Extracted Hook (paragraph 1): {preserved_sections['hook'][:100]}...")
             else:
-                print("✗ Warning: Hook section not found in content")
+                logger.warning("Hook section not found in content")
                 preserved_sections['hook'] = ""
             
             # Extract Summary (second paragraph - should be 2-3 lines ending with "read more...")
@@ -732,9 +901,9 @@ class AzureServices:
             summary_end = Config.SECTION_MARKERS['summary']['end']
             if summary_start < len(paragraphs):
                 preserved_sections['summary'] = paragraphs[summary_start:summary_end][0] if summary_end - summary_start == 1 else '\n\n'.join(paragraphs[summary_start:summary_end])
-                print(f"✓ Extracted Summary (paragraph 2): {preserved_sections['summary'][:100]}...")
+                logger.debug(f"Extracted Summary (paragraph 2): {preserved_sections['summary'][:100]}...")
             else:
-                print("✗ Warning: Summary section not found in content")
+                logger.warning("Summary section not found in content")
                 preserved_sections['summary'] = ""
             
 
@@ -743,16 +912,16 @@ class AzureServices:
             disclaimer_start = Config.SECTION_MARKERS['disclaimer']['start']
             if len(paragraphs) > 0:
                 preserved_sections['disclaimer'] = paragraphs[disclaimer_start]
-                print(f"✓ Extracted Disclaimer (paragraph {len(paragraphs)}): {preserved_sections['disclaimer'][:100]}...")
+                logger.debug(f"Extracted Disclaimer (paragraph {len(paragraphs)}): {preserved_sections['disclaimer'][:100]}...")
             else:
-                print("✗ Warning: Disclaimer section not found in content")
+                logger.warning("Disclaimer section not found in content")
                 preserved_sections['disclaimer'] = ""
             
-            print("=== SECTION EXTRACTION COMPLETE ===\n")
+            logger.debug("Section extraction complete")
             
             return preserved_sections
         except Exception as e:
-            print(f"Error extracting sections: {str(e)}")
+            logger.error(f"Error extracting sections: {str(e)}", exc_info=True)
             return {'hook': "", 'summary': "", 'disclaimer': ""}
 
     def _reconstruct_content(self, new_content, preserved_sections):
@@ -760,8 +929,7 @@ class AzureServices:
         try:
             paragraphs = new_content.split('\n\n')
             
-            print(f"\n=== RECONSTRUCTING CONTENT ===")
-            print(f"Total paragraphs in new content: {len(paragraphs)}")
+            logger.debug(f"Reconstructing content - Total paragraphs in new content: {len(paragraphs)}")
             
             # Remove any existing disclaimer or service description from the middle of the content
             # to prevent duplication, but preserve CTA content
@@ -772,31 +940,31 @@ class AzureServices:
                 is_duplicate_section = False
                 if preserved_sections['disclaimer'] and preserved_sections['disclaimer'].strip() == para.strip():
                     is_duplicate_section = True
-                    print(f"⚠️  Removed duplicate disclaimer from position {i+1}")
+                    logger.debug(f"Removed duplicate disclaimer from position {i+1}")
 
                 
                 if not is_duplicate_section:
                     cleaned_paragraphs.append(para)
             
             paragraphs = cleaned_paragraphs
-            print(f"Paragraphs after cleaning: {len(paragraphs)}")
+            logger.debug(f"Paragraphs after cleaning: {len(paragraphs)}")
             
             # Place preserved sections in their correct positions
             # Hook (first paragraph)
             if preserved_sections['hook'] and len(paragraphs) > 0:
                 paragraphs[0] = preserved_sections['hook']
-                print("✓ Preserved Hook section at position 1")
+                logger.debug("Preserved Hook section at position 1")
             
             # Summary (second paragraph - 2-3 lines ending with "read more...")
             if preserved_sections['summary'] and len(paragraphs) > 1:
                 paragraphs[1] = preserved_sections['summary']
-                print("✓ Preserved Summary section at position 2")
+                logger.debug("Preserved Summary section at position 2")
             elif preserved_sections['summary'] and len(paragraphs) <= 1:
                 # If there aren't enough paragraphs, add the summary as second paragraph
                 if len(paragraphs) == 0:
                     paragraphs.append("")  # Add empty first paragraph if needed
                 paragraphs.append(preserved_sections['summary'])
-                print("✓ Added Summary section at position 2")
+                logger.debug("Added Summary section at position 2")
             
 
             
@@ -804,24 +972,24 @@ class AzureServices:
             if preserved_sections['disclaimer']:
                 # Always add disclaimer at the very end
                 paragraphs.append(preserved_sections['disclaimer'])
-                print("✓ Added Disclaimer section at the very end")
+                logger.debug("Added Disclaimer section at the very end")
             
             final_content = '\n\n'.join(paragraphs)
             
             # Verify sections are preserved exactly
             if preserved_sections['hook'] and preserved_sections['hook'] not in final_content:
-                print("✗ Warning: Hook section not preserved exactly")
+                logger.warning("Hook section not preserved exactly")
             if preserved_sections['summary'] and preserved_sections['summary'] not in final_content:
-                print("✗ Warning: Summary section not preserved exactly")
+                logger.warning("Summary section not preserved exactly")
 
             if preserved_sections['disclaimer'] and preserved_sections['disclaimer'] not in final_content:
-                print("✗ Warning: Disclaimer section not preserved exactly")
+                logger.warning("Disclaimer section not preserved exactly")
             
-            print("=== RECONSTRUCTION COMPLETE ===\n")
+            logger.debug("Content reconstruction complete")
             
             return final_content
         except Exception as e:
-            print(f"Error preserving sections: {str(e)}")
+            logger.error(f"Error preserving sections: {str(e)}", exc_info=True)
             return new_content
 
     def _validate_with_gpt(self, original_text, new_content, components):
@@ -909,60 +1077,52 @@ class AzureServices:
             try:
                 validation_results = json.loads(response_content)
             except json.JSONDecodeError as e:
-                print(f"Error parsing JSON response: {str(e)}")
-                print(f"Raw response: {response_content}")
+                logger.error(f"Error parsing JSON response: {str(e)}", exc_info=True)
+                logger.debug(f"Raw response: {response_content}")
                 raise
 
             # Validate the structure of the response
             required_keys = ['components', 'preserved_sections', 'change_analysis', 'warnings', 'missing_components']
             if not all(key in validation_results for key in required_keys):
-                print("Invalid response structure. Missing required keys.")
+                logger.error("Invalid response structure. Missing required keys.")
                 raise ValueError("Invalid response structure")
 
-            # Print validation results in a readable format
-            print("\n=== GPT Article Validation Results ===")
-            
-            print("\nComponent Status:")
+            # Log validation results
+            logger.debug("GPT Article Validation Results:")
             for component, details in validation_results['components'].items():
                 status = '✓' if details.get('found', False) else '✗'
-                print(f"- {component}: {status}")
+                logger.debug(f"Component {component}: {status}")
                 if component == 'keywords' and details.get('variations'):
-                    print(f"  • Variations found: {', '.join(details['variations'])}")
+                    logger.debug(f"  Variations found: {', '.join(details['variations'])}")
                 if 'occurrences' in details:
-                    print(f"  • Occurrences: {details['occurrences']}")
+                    logger.debug(f"  Occurrences: {details['occurrences']}")
 
-            print("\nPreserved Sections:")
             for section, preserved in validation_results['preserved_sections'].items():
-                print(f"- {section}: {'✓' if preserved else '✗'}")
+                logger.debug(f"Preserved section {section}: {'✓' if preserved else '✗'}")
 
-            print(f"\nChange Analysis:")
-            print(f"- Change Percentage: {validation_results['change_analysis']['percentage']:.1f}%")
-            print(f"- Significant Changes: {'✓' if validation_results['change_analysis']['significant_changes'] else '✗'}")
-            print(f"- Maintained Essence: {'✓' if validation_results['change_analysis']['maintained_essence'] else '✗'}")
+            logger.debug(f"Change Analysis - Percentage: {validation_results['change_analysis']['percentage']:.1f}%")
+            logger.debug(f"Significant Changes: {'✓' if validation_results['change_analysis']['significant_changes'] else '✗'}")
+            logger.debug(f"Maintained Essence: {'✓' if validation_results['change_analysis']['maintained_essence'] else '✗'}")
 
             if validation_results['warnings']:
-                print("\nWarnings:")
                 for warning in validation_results['warnings']:
-                    print(f"- {warning}")
+                    logger.warning(f"Validation warning: {warning}")
 
             if validation_results['missing_components']:
-                print("\nMissing Components:")
                 for component in validation_results['missing_components']:
-                    print(f"- {component}")
-
-            print("===============================\n")
+                    logger.warning(f"Missing component: {component}")
 
             return validation_results
 
         except Exception as e:
-            print(f"Error in GPT validation: {str(e)}")
-            print("Unable to validate article components. Please check the generated content manually.")
+            logger.error(f"Error in GPT validation: {str(e)}", exc_info=True)
+            logger.warning("Unable to validate article components. Please check the generated content manually.")
             return None
 
     def rewrite_content(self, original_text, tone, tone_description, keywords, firm_name, location, lawyer_name, city, state, discovery_call_link, planning_session_name="15-minute discovery call"):
         try:
             # Extract sections to preserve
-            print("\nExtracting sections to preserve...")
+            logger.debug("Extracting sections to preserve...")
             preserved_sections = self._extract_sections(original_text)
             
             # CRITICAL: DO NOT MODIFY THESE SECTIONS {preserved_sections}:
@@ -1046,7 +1206,7 @@ class AzureServices:
                 Generate ONLY the main content (heading + body + CTA). The system will add hook, summary, date, and disclaimer automatically.
             """
             
-            print("\nGenerating rewritten content...")
+            logger.debug("Generating rewritten content...")
             response = self.text_client.chat.completions.create(
                 model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
                 messages=[
@@ -1060,11 +1220,11 @@ class AzureServices:
             rewritten_content = response.choices[0].message.content
             
             # Generate summary (2-3 sentences ending with "Read more...")
-            print("\nGenerating summary...")
+            logger.debug("Generating summary...")
             summary = self._generate_summary(rewritten_content, preserved_sections['hook'])
             
             # Final assembly with template
-            print("\nAssembling final article with template...")
+            logger.debug("Assembling final article with template...")
             final_content = self._assemble_final_article(preserved_sections['hook'], summary, rewritten_content, preserved_sections['disclaimer'], firm_name, discovery_call_link)
             
             # Validate the generated content using GPT
@@ -1082,13 +1242,13 @@ class AzureServices:
             validation_results = self._validate_with_gpt(original_text, final_content, components)
             
             if validation_results is None:
-                print("Warning: Article validation failed. Please review the content manually.")
+                logger.warning("Article validation failed. Please review the content manually.")
             
-            print("\nArticle generation complete!")
+            logger.info("Article generation complete!")
             return final_content
             
         except Exception as e:
-            print(f"Error in rewrite_content: {str(e)}")
+            logger.error(f"Error in rewrite_content: {str(e)}", exc_info=True)
             return original_text
 
     def edit_content(self, session_id, user_message, current_content=None):
@@ -1132,7 +1292,7 @@ class AzureServices:
     def _validate_and_cleanup_structure(self, content, preserved_sections):
         """Validate and cleanup the article structure to ensure it follows the exact format."""
         try:
-            print(f"\n=== VALIDATING AND CLEANING ARTICLE STRUCTURE ===")
+            logger.debug("Validating and cleaning article structure")
             
             paragraphs = content.split('\n\n')
             cleaned_paragraphs = []
@@ -1140,33 +1300,33 @@ class AzureServices:
             # Step 1: Ensure hook is first
             if preserved_sections['hook']:
                 cleaned_paragraphs.append(preserved_sections['hook'])
-                print("✓ Hook placed at position 1")
+                logger.debug("Hook placed at position 1")
             else:
-                print("⚠️  No hook found")
+                logger.warning("No hook found")
             
             # Step 2: Add line break after hook
             cleaned_paragraphs.append("")
-            print("✓ Added line break after hook")
+            logger.debug("Added line break after hook")
             
             # Step 3: Ensure summary is second (2-3 lines)
             if preserved_sections['summary']:
                 cleaned_paragraphs.append(preserved_sections['summary'])
-                print("✓ Summary placed at position 3")
+                logger.debug("Summary placed at position 3")
             else:
-                print("⚠️  No summary found")
+                logger.warning("No summary found")
             
             # Step 4: Add line break after summary
             cleaned_paragraphs.append("")
-            print("✓ Added line break after summary")
+            logger.debug("Added line break after summary")
             
             # Step 5: Add date
             current_date = datetime.now().strftime("%B %d, %Y")
             cleaned_paragraphs.append(f"**Date: {current_date}**")
-            print("✓ Added date")
+            logger.debug("Added date")
             
             # Step 6: Add line break after date
             cleaned_paragraphs.append("")
-            print("✓ Added line break after date")
+            logger.debug("Added line break after date")
             
             # Step 7: Find and organize content (heading, article content, CTA)
             cta_found = False
@@ -1199,14 +1359,14 @@ class AzureServices:
                 if any(phrase in para for phrase in cta_phrases):
                     cta_found = True
                     content_paragraphs.append(para)  # Include the CTA paragraph
-                    print(f"✓ Found CTA at paragraph {i+1}")
+                    logger.debug(f"Found CTA at paragraph {i+1}")
                     break
                 
                 # Check if this is a heading (starts with #)
                 if para.strip().startswith('#'):
                     if not heading_found:
                         heading_found = True
-                        print(f"✓ Found heading at paragraph {i+1}: {para.strip()[:50]}...")
+                        logger.debug(f"Found heading at paragraph {i+1}: {para.strip()[:50]}...")
                     content_paragraphs.append(para)
                 else:
                     # Add all other content paragraphs
@@ -1216,20 +1376,20 @@ class AzureServices:
             cleaned_paragraphs.extend(content_paragraphs)
             
             if not heading_found:
-                print("⚠️  No heading found in content")
+                logger.warning("No heading found in content")
             if not cta_found:
-                print("⚠️  No CTA found in content")
+                logger.warning("No CTA found in content")
             
             # Step 8: Add disclaimer at the end (only if it exists)
             if preserved_sections['disclaimer']:
                 cleaned_paragraphs.append(preserved_sections['disclaimer'])
-                print("✓ Disclaimer placed at the end")
+                logger.debug("Disclaimer placed at the end")
             else:
-                print("⚠️  No disclaimer found")
+                logger.warning("No disclaimer found")
             
             # Step 9: DROP EVERYTHING AFTER THE DISCLAIMER
             # The disclaimer should be the final paragraph - no additional content after it
-            print("✓ Dropped all content after disclaimer - disclaimer is the final paragraph")
+            logger.debug("Dropped all content after disclaimer - disclaimer is the final paragraph")
             
             # Clean up any empty paragraphs and ensure proper spacing
             final_paragraphs = []
@@ -1241,20 +1401,19 @@ class AzureServices:
             
             final_content = '\n\n'.join(final_paragraphs)
             
-            print(f"=== STRUCTURE VALIDATION COMPLETE ===")
-            print(f"Final structure: Hook → Line Break → Summary → Line Break → Date → Line Break → Heading → Content → CTA → Disclaimer")
-            print(f"Total paragraphs: {len(final_paragraphs)}")
+            logger.debug(f"Structure validation complete. Total paragraphs: {len(final_paragraphs)}")
+            logger.debug("Final structure: Hook → Line Break → Summary → Line Break → Date → Line Break → Heading → Content → CTA → Disclaimer")
             
             return final_content
             
         except Exception as e:
-            print(f"Error in structure validation: {str(e)}")
+            logger.error(f"Error in structure validation: {str(e)}", exc_info=True)
             return content
 
     def _generate_summary(self, article_content, hook):
         """Generate a 2-3 sentence summary ending with 'Read more...'"""
         try:
-            print(f"\n=== GENERATING SUMMARY ===")
+            logger.debug("Generating summary")
             
             summary_prompt = f"""
                 Generate a 2-3 sentence summary of this article that:
@@ -1286,20 +1445,20 @@ class AzureServices:
             if not summary.endswith("Read more..."):
                 summary = summary.rstrip('.') + ". Read more..."
             
-            print(f"✓ Generated summary: {summary[:100]}...")
-            print(f"=== SUMMARY GENERATION COMPLETE ===\n")
+            logger.debug(f"Generated summary: {summary[:100]}...")
+            logger.debug("Summary generation complete")
             
             return summary
             
         except Exception as e:
-            print(f"Error generating summary: {str(e)}")
+            logger.error(f"Error generating summary: {str(e)}", exc_info=True)
             # Fallback summary
             return "This article explores important considerations for protecting your family's future. Read more..."
 
     def _clean_article_content(self, article_content):
         """Clean and filter article content to remove unwanted elements"""
         try:
-            print(f"\n=== CLEANING ARTICLE CONTENT ===")
+            logger.debug("Cleaning article content")
             
             if not article_content:
                 return ""
@@ -1326,25 +1485,25 @@ class AzureServices:
                     'email newsletter',
                     'preview/summary'
                 ]):
-                    print(f"✓ Skipped preview text: {line[:50]}...")
+                    logger.debug(f"Skipped preview text: {line[:50]}...")
                     continue
                 
                 # Skip any date lines (we'll add our own)
                 if any(phrase in line.lower() for phrase in [
                     'date:', '**date:', '2025.', '2024.', '2023.'
                 ]):
-                    print(f"✓ Skipped date line: {line[:50]}...")
+                    logger.debug(f"Skipped date line: {line[:50]}...")
                     continue
                 
                 # Skip hook and summary content if they appear in the middle
                 if 'read more...' in line.lower() and len(line) < 200:
-                    print(f"✓ Skipped duplicate summary: {line[:50]}...")
+                    logger.debug(f"Skipped duplicate summary: {line[:50]}...")
                     continue
                 
                 # Look for the main heading (should start with #)
                 if line.startswith('#'):
                     skip_until_heading = False
-                    print(f"✓ Found heading: {line[:50]}...")
+                    logger.debug(f"Found heading: {line[:50]}...")
                 elif skip_until_heading and (
                     # Look for title-like content (longer lines that seem like titles)
                     (len(line) > 20 and len(line) < 100 and 
@@ -1355,7 +1514,7 @@ class AzureServices:
                     skip_until_heading = False
                     # Ensure proper heading format
                     line = f"# {line}"
-                    print(f"✓ Found heading: {line[:50]}...")
+                    logger.debug(f"Found heading: {line[:50]}...")
                 
                 # Only add lines after we've found the heading
                 if not skip_until_heading:
@@ -1364,19 +1523,19 @@ class AzureServices:
             # Join lines back together with proper spacing
             cleaned_content = '\n\n'.join(cleaned_lines)
             
-            print(f"✓ Content cleaned successfully")
-            print(f"=== CONTENT CLEANING COMPLETE ===\n")
+            logger.debug("Content cleaned successfully")
+            logger.debug("Content cleaning complete")
             
             return cleaned_content
             
         except Exception as e:
-            print(f"Error cleaning article content: {str(e)}")
+            logger.error(f"Error cleaning article content: {str(e)}", exc_info=True)
             return article_content
 
     def _assemble_final_article(self, hook, summary, article_content, disclaimer, firm_name="", discovery_call_link=""):
         """Assemble the final article using external template file"""
         try:
-            print(f"\n=== ASSEMBLING FINAL ARTICLE WITH EXTERNAL TEMPLATE ===")
+            logger.debug("Assembling final article with external template")
             
             # Get current date
             current_date = datetime.now().strftime("%B %d, %Y")
@@ -1389,9 +1548,9 @@ class AzureServices:
             try:
                 with open(template_path, 'r', encoding='utf-8') as f:
                     template_content = f.read()
-                print("✓ External template loaded successfully")
+                logger.debug("External template loaded successfully")
             except FileNotFoundError:
-                print("⚠️  Template file not found, using fallback template")
+                logger.warning("Template file not found, using fallback template")
                 template_content = """Weekly blog preview/summary you can use on your main blog page and Featured Article section of your email newsletter:
 
 {summary of the article}
@@ -1424,19 +1583,19 @@ The content is sourced from Personal Family Lawyer® for use by Personal Family 
                         lines = lines[1:]
                 final_content = '\n'.join(lines)
             
-            print(f"✓ Article assembled using external template")
-            print(f"=== EXTERNAL TEMPLATE ASSEMBLY COMPLETE ===\n")
+            logger.debug("Article assembled using external template")
+            logger.debug("External template assembly complete")
             
             return final_content
             
         except Exception as e:
-            print(f"Error assembling final article: {str(e)}")
+            logger.error(f"Error assembling final article: {str(e)}", exc_info=True)
             return article_content
 
     def _format_markdown(self, content):
         """Apply final markdown formatting to ensure proper structure and formatting."""
         try:
-            print(f"\n=== APPLYING FINAL MARKDOWN FORMATTING ===")
+            logger.debug("Applying final markdown formatting")
             
             # Extract the preserved sections first
             preserved_sections = self._extract_sections(content)
@@ -1483,17 +1642,17 @@ The content is sourced from Personal Family Lawyer® for use by Personal Family 
             formatted_content = response.choices[0].message.content.strip()
             
             # Validate that preserved sections are still in their correct positions
-            print("Validating preserved sections after formatting...")
+            logger.debug("Validating preserved sections after formatting")
             final_content = self._validate_and_cleanup_structure(formatted_content, preserved_sections)
             
-            print("✓ Markdown formatting applied successfully")
-            print(f"=== MARKDOWN FORMATTING COMPLETE ===\n")
+            logger.debug("Markdown formatting applied successfully")
+            logger.debug("Markdown formatting complete")
             
             return final_content
             
         except Exception as e:
-            print(f"Error in markdown formatting: {str(e)}")
-            print("Returning original content without markdown formatting")
+            logger.error(f"Error in markdown formatting: {str(e)}", exc_info=True)
+            logger.debug("Returning original content without markdown formatting")
             return content
 
 class ImageGenerator:
@@ -1534,7 +1693,7 @@ class ImageGenerator:
             return image_filename
             
         except Exception as e:
-            print(f"Image generation failed: {e}")
+            logger.error(f"Image generation failed: {e}", exc_info=True)
             return None
         
     def _get_safe_image_prompt(self, text_prompt):
@@ -1585,7 +1744,7 @@ class FileManager:
                 filename = row[0] if not hasattr(row, 'keys') else row['filename']
                 db_articles.add(filename)
         except Exception as e:
-            print(f"Error getting articles from database: {str(e)}")
+            logger.error(f"Error getting articles from database: {str(e)}", exc_info=True)
         
         # Get articles from file system
         fs_articles = set()
@@ -1593,13 +1752,13 @@ class FileManager:
             docx_dir = os.path.join(Config.ARTICLES_DIR, 'docx')
             fs_articles = set([f for f in os.listdir(docx_dir) if f.endswith('.docx')])
         except Exception as e:
-            print(f"Error getting articles from file system: {str(e)}")
+            logger.error(f"Error getting articles from file system: {str(e)}", exc_info=True)
         
         # Combine both sources
         all_articles = list(db_articles.union(fs_articles))
-        print(f"DEBUG: list_articles() found {len(all_articles)} total articles")
-        print(f"DEBUG: Database articles: {list(db_articles)}")
-        print(f"DEBUG: File system articles: {list(fs_articles)}")
+        logger.debug(f"list_articles() found {len(all_articles)} total articles")
+        logger.debug(f"Database articles: {list(db_articles)}")
+        logger.debug(f"File system articles: {list(fs_articles)}")
         
         return all_articles
     
@@ -1621,10 +1780,9 @@ class FileManager:
             """)
             articles = cursor.fetchall()
             
-            print(f"DEBUG: Found {len(articles)} articles in database")
-            print(f"DEBUG: First article type: {type(articles[0]) if articles else 'No articles'}")
+            logger.debug(f"Found {len(articles)} articles in database")
             if articles:
-                print(f"DEBUG: First article content: {articles[0]}")
+                logger.debug(f"First article type: {type(articles[0])}")
             
             result = {}
             for i, article in enumerate(articles):
@@ -1647,13 +1805,12 @@ class FileManager:
                             'description': article[2],  # description
                             'status': article[4]   # status
                         }
-                    print(f"DEBUG: Successfully processed article {i}: {filename}")
+                    logger.debug(f"Successfully processed article {i}: {filename}")
                 except Exception as e:
-                    print(f"DEBUG: Error processing article {i}: {str(e)}")
-                    print(f"DEBUG: Article data: {article}")
+                    logger.warning(f"Error processing article {i}: {str(e)}", exc_info=True)
                     continue
             
-            print(f"DEBUG: Final result has {len(result)} articles")
+            logger.debug(f"Final result has {len(result)} articles")
             
             # Also load existing articles from metadata.json to preserve descriptions
             metadata_path = os.path.join(Config.ARTICLES_DIR, 'metadata.json')
@@ -1669,20 +1826,14 @@ class FileManager:
                             # Merge descriptions from metadata.json if database description is empty
                             if not result[filename].get('description') and article.get('description'):
                                 result[filename]['description'] = article['description']
-                print(f"DEBUG: After merging metadata.json, final result has {len(result)} articles")
-                print(f"DEBUG: Final article list: {list(result.keys())}")
-                # Debug specific article
-                target_article = "Don't Lose Your Family Stories_ How to Preserve Your Legacy Before It's Too Late.docx"
-                if target_article in result:
-                    print(f"DEBUG: Found target article metadata: {result[target_article]}")
-                else:
-                    print(f"DEBUG: Target article not found in result. Available keys: {list(result.keys())}")
+                logger.debug(f"After merging metadata.json, final result has {len(result)} articles")
+                logger.debug(f"Final article list: {list(result.keys())}")
             except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                print(f"DEBUG: Could not load metadata.json: {str(e)}")
+                logger.warning(f"Could not load metadata.json: {str(e)}", exc_info=True)
             
             return result
         except Exception as e:
-            print(f"Error reading article metadata from database: {str(e)}")
+            logger.error(f"Error reading article metadata from database: {str(e)}", exc_info=True)
             # Fallback to metadata.json for backward compatibility
             metadata_path = os.path.join(Config.ARTICLES_DIR, 'metadata.json')
             try:
@@ -1692,7 +1843,7 @@ class FileManager:
                     result = {article['filename']: article for article in metadata['articles']}
                     return result
             except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-                print(f"Error reading metadata.json fallback: {str(e)}")
+                logger.error(f"Error reading metadata.json fallback: {str(e)}", exc_info=True)
                 return {}
     
     @staticmethod
@@ -1730,7 +1881,7 @@ class FileManager:
                 return text.strip()
             
         except Exception as e:
-            print(f"Error reading from database: {str(e)}")
+            logger.error(f"Error reading from database: {str(e)}", exc_info=True)
         
         # Fallback to file system
         try:
@@ -1747,7 +1898,7 @@ class FileManager:
             return "\n".join([para.text for para in doc.paragraphs])
             
         except Exception as e:
-            print(f"Error reading from file system: {str(e)}")
+            logger.error(f"Error reading from file system: {str(e)}", exc_info=True)
             raise FileNotFoundError(f"Article file not found: {decoded_filename}")
 
     @staticmethod
@@ -1777,7 +1928,7 @@ class FileManager:
                 return article[0] if not hasattr(article, 'keys') else article['markdown_content']
             
         except Exception as e:
-            print(f"Error reading markdown from database: {str(e)}")
+            logger.error(f"Error reading markdown from database: {str(e)}", exc_info=True)
         
         # Fallback to file system
         try:
@@ -1800,7 +1951,7 @@ class FileManager:
                 return f.read()
                 
         except Exception as e:
-            print(f"Error reading markdown from file system: {str(e)}")
+            logger.error(f"Error reading markdown from file system: {str(e)}", exc_info=True)
             raise FileNotFoundError(f"Markdown file not found: {decoded_filename}")
     
     @staticmethod
@@ -1935,26 +2086,28 @@ def home():
     return redirect(url_for('dashboard'))
 
 @app.route('/register', methods=['GET', 'POST'])
+@limiter.limit("3 per minute")  # Limit registration attempts to 3 per minute per IP
 def register():
     if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
-        firm = request.form['firm']
-        location = request.form['location']
-        lawyer_name = request.form['lawyer_name']
-        state = request.form['state']
-        address = request.form.get('address', '')
-        planning_session = request.form.get('planning_session', '')
-        other_planning_session = request.form.get('other_planning_session', '')
-        discovery_call_link = request.form.get('discovery_call_link', '')
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        firm = request.form.get('firm', '').strip()
+        location = request.form.get('location', '').strip()
+        lawyer_name = request.form.get('lawyer_name', '').strip()
+        state = request.form.get('state', '').strip()
+        address = request.form.get('address', '').strip()
+        planning_session = request.form.get('planning_session', '').strip()
+        other_planning_session = request.form.get('other_planning_session', '').strip()
+        discovery_call_link = request.form.get('discovery_call_link', '').strip()
 
-        if UserSession.register(email, password, firm, location, lawyer_name, state, 
-                              address, planning_session, other_planning_session, discovery_call_link):
+        success, error = UserSession.register(email, password, firm, location, lawyer_name, state, 
+                              address, planning_session, other_planning_session, discovery_call_link)
+        if success:
             # Auto-login after registration
             UserSession.login(email, password)
             return redirect(url_for('dashboard'))
         
-        return render_template('register.html', error="Email already registered")
+        return render_template('register.html', error=error or "Registration failed. Please try again.")
     
     return render_template('register.html')
 
@@ -2035,17 +2188,44 @@ def profile():
     return render_template('profile.html', user=session['user'])
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")  # Limit login attempts to 5 per minute per IP
 def login():
     if request.method == 'POST':
-        if UserSession.login(request.form['email'], request.form['password']):
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        
+        # Basic validation
+        if not email or not password:
+            return render_template('login.html', error="Email and password are required")
+        
+        email_valid, email_error = validate_email(email)
+        if not email_valid:
+            return render_template('login.html', error=email_error)
+        
+        if len(password) > 128:
+            return render_template('login.html', error="Invalid credentials")
+        
+        if UserSession.login(email, password):
+            logger.info(f"User logged in successfully: {email}")
             return redirect(url_for('dashboard'))
+        
+        logger.warning(f"Failed login attempt for email: {email}")
         return render_template('login.html', error="Invalid credentials")
     return render_template('login.html')
 
 @app.route('/forgot_password', methods=['GET', 'POST'])
+@limiter.limit("3 per hour")  # Limit password reset requests to 3 per hour per IP
 def forgot_password():
     if request.method == 'POST':
-        email = request.form['email']
+        email = request.form.get('email', '').strip()
+        
+        # Validate email
+        if not email:
+            return render_template('forgot_password.html', error="Email is required")
+        
+        email_valid, email_error = validate_email(email)
+        if not email_valid:
+            return render_template('forgot_password.html', error=email_error)
         
         # Check if user exists
         db = get_db()
@@ -2080,6 +2260,7 @@ def forgot_password():
     return render_template('forgot_password.html')
 
 @app.route('/reset_password/<token>', methods=['GET', 'POST'])
+@limiter.limit("5 per hour")  # Limit password reset attempts to 5 per hour per IP
 def reset_password(token):
     db = get_db()
     
@@ -2101,13 +2282,15 @@ def reset_password(token):
             return render_template('reset_password.html', token=token,
                                  error="Passwords do not match.")
         
-        if len(password) < 6:
-            return render_template('reset_password.html', token=token,
-                                 error="Password must be at least 6 characters long.")
+        # Validate password strength
+        password_valid, password_error = validate_password(password)
+        if not password_valid:
+            return render_template('reset_password.html', token=token, error=password_error)
         
-        # Update user password - store as plain text
+        # Hash password before storing
+        hashed_password = generate_password_hash(password)
         db.execute('UPDATE users SET password = ? WHERE email = ?', 
-                  (password, reset_record[1]))
+                  (hashed_password, reset_record[1]))
         
         # Mark token as used
         db.execute('UPDATE password_resets SET used = 1 WHERE token = ?', (token,))
@@ -2172,6 +2355,7 @@ def dashboard():
                          series_list=series_list)
 
 @app.route('/add_tone', methods=['POST'])
+@limiter.limit("10 per hour")  # Limit custom tone creation
 def add_tone():
     user = UserSession.get_current_user()
     if not user:
@@ -2194,6 +2378,7 @@ def add_tone():
     return jsonify({'success': False, 'error': 'Tone with this name already exists'}), 400
 
 @app.route('/submit_feedback', methods=['POST'])
+@limiter.limit("5 per hour")  # Limit feedback submissions
 def submit_feedback():
     if 'user' not in session:
         return jsonify({'success': False, 'message': 'User not authenticated'})
@@ -2218,12 +2403,13 @@ def submit_feedback():
                     return jsonify({'success': False, 'message': 'An error occurred while submitting feedback'})
     
     except Exception as e:
-        print(f"Error submitting feedback: {str(e)}")
+        logger.error(f"Error submitting feedback: {str(e)}", exc_info=True)
         return jsonify({'success': False, 'message': 'An error occurred while submitting feedback'})
 
 
 
 @app.route('/select/<article>', methods=['GET', 'POST'])
+@limiter.limit("10 per hour")  # Limit content generation to 10 per hour per user/IP
 async def select_article(article):
     user = UserSession.get_current_user()
     if not user:
@@ -2262,11 +2448,9 @@ async def select_article(article):
         # Call Azure Function for content generation
         function_url = f"{FUNCTION_APP_URL}/api/content_generator?code={FUNCTION_KEY}"
         
-        # Add console logging to debug the issue
-        print(f"🔍 DEBUG: FUNCTION_APP_URL = {FUNCTION_APP_URL}")
-        print(f"🔍 DEBUG: FUNCTION_KEY = {FUNCTION_KEY[:10]}..." if FUNCTION_KEY else "🔍 DEBUG: FUNCTION_KEY = None")
-        print(f"🔍 DEBUG: SIMULATE_OPENAI = {SIMULATE_OPENAI}")
-        print(f"🔍 DEBUG: Function URL = {function_url}")
+        # Log content generation request
+        logger.debug(f"Content generation request - Article: {article}, Tone: {tone}, Firm: {firm}")
+        logger.debug(f"Function URL: {function_url}")
         
         payload = {
             "original_text": FileManager.read_docx(article),
@@ -2282,13 +2466,10 @@ async def select_article(article):
             "discovery_call_link": discovery_call_link
         }
         
-        print(f"🔍 DEBUG: Payload prepared with {len(payload)} items")
-        print(f"🔍 DEBUG: Firm name = {firm}")
-        print(f"🔍 DEBUG: Tone = {tone}")
-        print(f"🔍 DEBUG: Keywords = {keywords}")
+        logger.debug(f"Payload prepared with {len(payload)} items")
         
         if SIMULATE_OPENAI:
-            print("🔍 DEBUG: Using SIMULATE_OPENAI mode")
+            logger.info("Using SIMULATE_OPENAI mode for content generation")
             await simulate_openai_call()
             blog_content = "Simulated blog content"
             
@@ -2306,23 +2487,21 @@ async def select_article(article):
                 additional_data=f"Article: {article}, Tone: {tone}, Keywords: {keywords}"
             )
         else:
-            print("🔍 DEBUG: Making actual HTTP request to Azure Function")
+            logger.info("Making HTTP request to Azure Function for content generation")
             try:
                 import aiohttp
                 async with aiohttp.ClientSession() as client_session:
-                    print(f"🔍 DEBUG: Sending POST request to: {function_url}")
-                    print(f"🔍 DEBUG: Request payload size: {len(str(payload))} characters")
+                    logger.debug(f"Sending POST request to: {function_url}")
+                    logger.debug(f"Request payload size: {len(str(payload))} characters")
                     
                     async with client_session.post(function_url, json=payload) as response:
-                        print(f"🔍 DEBUG: Response status: {response.status}")
-                        print(f"🔍 DEBUG: Response headers: {dict(response.headers)}")
+                        logger.debug(f"Response status: {response.status}")
                         
                         response_text = await response.text()
-                        print(f"🔍 DEBUG: Response text length: {len(response_text)}")
-                        print(f"🔍 DEBUG: Response text preview: {response_text[:500]}...")
+                        logger.debug(f"Response text length: {len(response_text)}")
                         
                         if response.status != 200:
-                            print(f"🔍 DEBUG: Error response: {response_text}")
+                            logger.error(f"Content generation failed with status {response.status}: {response_text[:500]}")
                             
                             # Log failed activity
                             UserActivityTracker.log_activity(
@@ -2342,9 +2521,9 @@ async def select_article(article):
                             raise Exception(f"Function error: {response_text}")
                         
                         result = await response.json()
-                        print(f"🔍 DEBUG: Parsed JSON result keys: {list(result.keys())}")
+                        logger.debug(f"Parsed JSON result keys: {list(result.keys())}")
                         blog_content = result["content"]
-                        print(f"🔍 DEBUG: Generated content length: {len(blog_content)}")
+                        logger.info(f"Content generation successful. Generated content length: {len(blog_content)}")
                         
                         # Log successful activity
                         UserActivityTracker.log_activity(
@@ -2361,8 +2540,7 @@ async def select_article(article):
                         )
                         
             except Exception as e:
-                print(f"🔍 DEBUG: Exception occurred: {str(e)}")
-                print(f"🔍 DEBUG: Exception type: {type(e).__name__}")
+                logger.error(f"Content generation exception: {str(e)}", exc_info=True)
                 
                 # Log exception activity
                 UserActivityTracker.log_activity(
@@ -2453,6 +2631,7 @@ def finalize():
                          image_url=image_url)
 
 @app.route('/review', methods=['GET', 'POST'])
+@limiter.limit("30 per hour")  # Limit content editing to 30 per hour per user/IP
 async def review():
     # Check if we have a filename parameter but no current_post in session
     filename = request.args.get('filename')
@@ -2482,10 +2661,10 @@ async def review():
             # Generate a unique session ID for the chat
             session['session_id'] = os.urandom(16).hex()
         except (ValueError, FileNotFoundError) as e:
-            print(f"Error loading file: {e}")
+            logger.error(f"Error loading file: {e}", exc_info=True)
             return redirect(url_for('dashboard'))
         except Exception as e:
-            print(f"Error loading file: {e}")
+            logger.error(f"Error loading file: {e}", exc_info=True)
             return redirect(url_for('dashboard'))
     
     # If we still don't have current_post in session, redirect to dashboard
@@ -2526,13 +2705,13 @@ async def review():
                 "current_content": current_content
             }
             
-            print(f"🔍 DEBUG: Content Editor - Function URL = {function_url}")
-            print(f"🔍 DEBUG: Content Editor - Payload keys = {list(payload.keys())}")
-            print(f"🔍 DEBUG: Content Editor - User message = {user_message[:50]}...")
-            print(f"🔍 DEBUG: Content Editor - Current content length = {len(current_content)}")
+            logger.debug(f"Content Editor - Function URL: {function_url}")
+            logger.debug(f"Content Editor - Payload keys: {list(payload.keys())}")
+            logger.debug(f"Content Editor - User message: {user_message[:50]}...")
+            logger.debug(f"Content Editor - Current content length: {len(current_content)}")
             
             if SIMULATE_OPENAI:
-                print("🔍 DEBUG: Content Editor - Using SIMULATE_OPENAI mode")
+                logger.info("Content Editor - Using SIMULATE_OPENAI mode")
                 await simulate_openai_call()
                 edited_content = current_content  # Return current content for simulation
                 
@@ -2550,21 +2729,20 @@ async def review():
                     additional_data=f"User message: {user_message[:100]}..."
                 )
             else:
-                print("🔍 DEBUG: Content Editor - Making actual HTTP request to Azure Function")
+                logger.info("Content Editor - Making HTTP request to Azure Function")
                 try:
                     import aiohttp
                     async with aiohttp.ClientSession() as client_session:
-                        print(f"🔍 DEBUG: Content Editor - Sending POST request to: {function_url}")
+                        logger.debug(f"Content Editor - Sending POST request to: {function_url}")
                         
                         async with client_session.post(function_url, json=payload) as response:
-                            print(f"🔍 DEBUG: Content Editor - Response status: {response.status}")
+                            logger.debug(f"Content Editor - Response status: {response.status}")
                             
                             response_text = await response.text()
-                            print(f"🔍 DEBUG: Content Editor - Response text length: {len(response_text)}")
-                            print(f"🔍 DEBUG: Content Editor - Response text preview: {response_text[:500]}...")
+                            logger.debug(f"Content Editor - Response text length: {len(response_text)}")
                             
                             if response.status != 200:
-                                print(f"🔍 DEBUG: Content Editor - Error response: {response_text}")
+                                logger.error(f"Content Editor - Error response (status {response.status}): {response_text[:500]}")
                                 
                                 # Log failed activity
                                 UserActivityTracker.log_activity(
@@ -2584,9 +2762,9 @@ async def review():
                                 raise Exception(f"Function error: {response_text}")
                             
                             result = await response.json()
-                            print(f"🔍 DEBUG: Content Editor - Parsed JSON result keys: {list(result.keys())}")
+                            logger.debug(f"Content Editor - Parsed JSON result keys: {list(result.keys())}")
                             edited_content = result["edited_content"]
-                            print(f"🔍 DEBUG: Content Editor - Edited content length: {len(edited_content)}")
+                            logger.info(f"Content Editor - Edit successful. Edited content length: {len(edited_content)}")
                             
                             # Log successful activity
                             UserActivityTracker.log_activity(
@@ -2603,8 +2781,7 @@ async def review():
                             )
                             
                 except Exception as e:
-                    print(f"🔍 DEBUG: Content Editor - Exception occurred: {str(e)}")
-                    print(f"🔍 DEBUG: Content Editor - Exception type: {type(e).__name__}")
+                    logger.error(f"Content Editor - Exception occurred: {str(e)}", exc_info=True)
                     
                     # Log exception activity
                     UserActivityTracker.log_activity(
@@ -2666,7 +2843,7 @@ async def review():
             # Convert markdown to HTML for proper display
             source_article_content = markdown.markdown(markdown_content)
         except Exception as e:
-            print(f"Error reading source article: {e}")
+            logger.error(f"Error reading source article: {e}", exc_info=True)
             source_article_content = "Source article not available"
     
     image_url = url_for('static', filename=f'generated/{post["image"]}') if post.get('image') else None
@@ -2711,12 +2888,12 @@ def download(filename):
         
         # Simple path traversal check - look for .. in the path
         if '..' in normalized_path:
-            print(f"Path traversal detected: {normalized_path}")
+            logger.warning(f"Path traversal detected: {normalized_path}")
             return redirect(url_for('review'))
         
         # Check if file exists
         if not os.path.exists(normalized_path):
-            print(f"File not found: {normalized_path}")
+            logger.warning(f"File not found: {normalized_path}")
             return redirect(url_for('review'))
         
         with open(normalized_path, 'r', encoding='utf-8') as f:
@@ -2736,10 +2913,11 @@ def download(filename):
         )
         
     except Exception as e:
-        print(f"Download error: {e}")
+        logger.error(f"Download error: {e}", exc_info=True)
         return redirect(url_for('review'))
 
 @app.route('/generate_image')
+@limiter.limit("20 per hour")  # Limit image generation to 20 per hour per user/IP
 async def generate_image():
     if 'current_post' not in session:
         return redirect(url_for('dashboard'))
@@ -2753,12 +2931,12 @@ async def generate_image():
         "text_prompt": session['current_post']['content']
     }
     
-    print(f"🔍 DEBUG: Image Generator - Function URL = {function_url}")
-    print(f"🔍 DEBUG: Image Generator - Payload keys = {list(payload.keys())}")
-    print(f"🔍 DEBUG: Image Generator - Text prompt length = {len(payload['text_prompt'])}")
+    logger.debug(f"Image Generator - Function URL: {function_url}")
+    logger.debug(f"Image Generator - Payload keys: {list(payload.keys())}")
+    logger.debug(f"Image Generator - Text prompt length: {len(payload['text_prompt'])}")
     
     if SIMULATE_OPENAI:
-        print("🔍 DEBUG: Image Generator - Using SIMULATE_OPENAI mode")
+        logger.info("Image Generator - Using SIMULATE_OPENAI mode")
         await simulate_openai_call()
         session['current_post']['image'] = "dummy.png"
         session.modified = True
@@ -2779,21 +2957,20 @@ async def generate_image():
         
         return redirect(url_for('review'))
     
-    print("🔍 DEBUG: Image Generator - Making actual HTTP request to Azure Function")
+    logger.info("Image Generator - Making HTTP request to Azure Function")
     try:
         import aiohttp, base64, os
         async with aiohttp.ClientSession() as client_session:
-            print(f"🔍 DEBUG: Image Generator - Sending POST request to: {function_url}")
+            logger.debug(f"Image Generator - Sending POST request to: {function_url}")
             
             async with client_session.post(function_url, json=payload) as response:
-                print(f"🔍 DEBUG: Image Generator - Response status: {response.status}")
+                logger.debug(f"Image Generator - Response status: {response.status}")
                 
                 response_text = await response.text()
-                print(f"🔍 DEBUG: Image Generator - Response text length: {len(response_text)}")
-                print(f"🔍 DEBUG: Image Generator - Response text preview: {response_text[:500]}...")
+                logger.debug(f"Image Generator - Response text length: {len(response_text)}")
                 
                 if response.status != 200:
-                    print(f"🔍 DEBUG: Image Generator - Error response: {response_text}")
+                    logger.error(f"Image Generator - Error response (status {response.status}): {response_text[:500]}")
                     
                     # Log failed activity
                     UserActivityTracker.log_activity(
@@ -2813,7 +2990,8 @@ async def generate_image():
                     raise Exception(f"Function error: {response_text}")
                 
                 result = await response.json()
-                print(f"🔍 DEBUG: Image Generator - Parsed JSON result keys: {list(result.keys())}")
+                logger.debug(f"Image Generator - Parsed JSON result keys: {list(result.keys())}")
+                logger.info(f"Image Generator - Image generation successful. Filename: {result.get('image_filename', 'unknown')}")
                 
                 # Log successful activity
                 UserActivityTracker.log_activity(
@@ -2830,8 +3008,7 @@ async def generate_image():
                 )
                 
     except Exception as e:
-        print(f"🔍 DEBUG: Image Generator - Exception occurred: {str(e)}")
-        print(f"🔍 DEBUG: Image Generator - Exception type: {type(e).__name__}")
+        logger.error(f"Image Generator - Exception occurred: {str(e)}", exc_info=True)
         
         # Log exception activity
         UserActivityTracker.log_activity(
@@ -2864,9 +3041,7 @@ async def generate_image():
     
     return redirect(url_for('review'))
     
-@app.teardown_appcontext
-def teardown_db(exception):
-    close_db()
+# Database cleanup is handled by close_db() function above
 
 @app.route('/preview_article/<article>')
 def preview_article(article):
@@ -2908,13 +3083,22 @@ def preview_article(article):
         html_content = markdown.markdown(content)
         return jsonify({'content': html_content})
     except (ValueError, FileNotFoundError) as e:
-        print(f"File access error in preview_article: {str(e)}")
+        logger.error(f"File access error in preview_article: {str(e)}", exc_info=True)
         return jsonify({'error': 'Article not found'}), 404
     except Exception as e:
-        print(f"Error in preview_article: {str(e)}")  # Add logging
+        logger.error(f"Error in preview_article: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-def is_safe_filename(filename):
+def is_safe_filename(filename: str) -> bool:
+    """
+    Check if a filename is safe to use (prevents path traversal attacks).
+    
+    Args:
+        filename: Filename to validate
+        
+    Returns:
+        True if filename is safe, False otherwise
+    """
     """Validate that filename is safe and doesn't contain path traversal characters"""
     if not filename:
         return False
@@ -3038,7 +3222,7 @@ def admin_articles():
         except Exception as e:
             db.rollback()
             flash(f'Error uploading article: {str(e)}', 'error')
-            print(f"Upload error: {e}")
+            logger.error(f"Upload error: {e}", exc_info=True)
     
     # Get all articles for display
     cursor.execute("""
@@ -3051,5 +3235,29 @@ def admin_articles():
     
     return render_template('admin/articles.html', articles=articles)
 
+# Error handlers for standardized error handling
+@app.errorhandler(404)
+def not_found_error(error):
+    logger.warning(f"404 error: {request.url}")
+    return render_template('error.html', error_code=404, error_message="Page not found"), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"500 error: {str(error)}", exc_info=True)
+    return render_template('error.html', error_code=500, error_message="Internal server error"), 500
+
+@app.errorhandler(403)
+def forbidden_error(error):
+    logger.warning(f"403 error: {request.url}")
+    return render_template('error.html', error_code=403, error_message="Access forbidden"), 403
+
+@app.errorhandler(400)
+def bad_request_error(error):
+    logger.warning(f"400 error: {request.url}")
+    return render_template('error.html', error_code=400, error_message="Bad request"), 400
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    # Debug mode should only be enabled in development
+    # Set FLASK_DEBUG=true in .env for development, false/absent for production
+    debug_mode = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=8000, debug=debug_mode)

@@ -222,6 +222,7 @@
                                     </div>
                                     <div class="card-body">
                                         <form id="aiEditForm" method="POST">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                                             <div class="mb-3">
                                                 <textarea name="edit_message" class="form-control" rows="3" placeholder="Type your edit instructions here..."></textarea>
                                             </div>
@@ -337,6 +338,7 @@
                                     </div>
                                     <div class="card-body">
                                         <form method="POST">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                                             <div class="mb-3">
                                                 <textarea name="content" class="form-control" rows="20">{{ post.content }}</textarea>
                                             </div>

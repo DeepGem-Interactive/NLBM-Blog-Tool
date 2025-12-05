@@ -46,6 +46,7 @@
         <h2 class="h4 mb-3">Article: {{ article_name }}</h2>
         
         <form method="POST" action="{{ url_for('select_article', article=article_name) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
             <div class="row">
                 <div class="col-md-6 mb-4">
                     <div class="card h-100">
