@@ -199,7 +199,7 @@ def close_db(error=None):
     db = g.pop('db', None)
     if db is not None:
         try:
-        db.close()
+            db.close()
             logger.debug("Database connection closed")
         except Exception as e:
             logger.warning(f"Error closing database connection: {e}", exc_info=True)
@@ -708,15 +708,15 @@ class UserSession:
             return True
         else:
             # Log failed login attempt if user exists
-                UserActivityTracker.log_activity(
-                    user_id=user.id,
-                    activity_type="authentication",
-                    feature_name="User Login",
-                    api_endpoint="N/A",
-                    success=False,
-                    error_message="Invalid password",
-                    additional_data=f"Failed login attempt from email: {email}"
-                )
+            UserActivityTracker.log_activity(
+                user_id=user.id,
+                activity_type="authentication",
+                feature_name="User Login",
+                api_endpoint="N/A",
+                success=False,
+                error_message="Invalid password",
+                additional_data=f"Failed login attempt from email: {email}"
+            )
             return False
 
     @staticmethod
